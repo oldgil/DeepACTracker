@@ -1,0 +1,111 @@
+--require 'utils.data'
+local DataLoader = torch.class('tracking.DataLoader')
+
+local data = tracking.mot_data
+
+
+
+function DataLoader:__init(args)
+    self.filename = args.filename
+    self._n_rois  = args._n_rois
+    self.hist_len = args.hist_len
+    self.dataPath = data.dataPath
+    self.det_file = self.dataPath..'/det/det.txt'
+    self.gt_file  = self.dataPath..'/gt/gt.txt'
+    self.img_path = self.dataPath..'/img1/'
+    self.skip_step = 1
+
+    self._cur_image  = 1
+
+
+    self.det_data = data.readTXT(self.det_file,2)
+    self.gt_data  = data.readTXT(self.gt_file,1)
+
+    self.imgs = data.loadImages(self.img_path)
+    self._n_images = #self.imgs
+    self.cur_state = {}
+    
+end
+
+
+function DataLoader:_restartLoader()
+	self._cur_image = 1
+	--self._rand_perm = torch.randperm(self._n_images)
+end
+
+
+function DataLoader:getNextState()
+	if self._cur_image + self.hist_len + 1  > self._n_images then
+		self:_restartLoader()
+	end
+        
+        local gt = torch.Tensor(self.hist_len,self._n_rois,1)
+        local rois = torch.Tensor(self.hist_len,self._n_rois,4):zero()
+        
+        if self.cur_state.cur_image == nil then 
+            self.cur_state.cur_image = {}
+            self.cur_state.pre_image = {}
+        end
+
+
+        -- start da
+        if self._cur_image == 1 then
+                       self.cur_state[1].cur_image = self.imgs[self._cur_image]
+            self.cur_state[1].pre_image = self.imgs[self._cur_image]
+            for i = 2, self.hist_len do
+
+                self.cur_state.cur_image = self.imgs[self._cur_image]
+                self.cur_state.pre_image = self.imgs[self._cur_image]
+            end
+
+        end
+
+
+	local img_inds = self._rand_perm[{{self._cur_image,self._cur_image + config.img_per_batch -1}}]
+	self._cur_image = self._cur_image + config.img_per_batch
+	return img_inds
+end
+
+function DataLoader:getGt()
+
+
+end
+
+
+
+-----------------useless-------------------------------
+function DataLoader:_visualize_batch(im,boxes)
+  local ok = pcall(require,'qt')
+  if not ok then
+    error('You need to run visualize_detections using qlua')
+  end
+  require 'qttorch'
+  require 'qtwidget'
+
+  local num_boxes = boxes:size(1)
+  local widths  = boxes[{{},3}] - boxes[{{},1}]
+  local heights = boxes[{{},4}] - boxes[{{},2}]
+
+  local x,y = im:size(3),im:size(2)
+  local w = qtwidget.newwindow(x,y,"Detections")
+  local qtimg = qt.QImage.fromTensor(im)
+  w:image(0,0,x,y,qtimg)
+  local fontsize = 15
+
+  for i=1,num_boxes do
+    local x,y = boxes[{i,1}],boxes[{i,2}]
+    local width,height = widths[i], heights[i]
+    
+    -- add bbox
+    w:setcolor("red")
+    w:rectangle(x,y,width,height)
+    w:moveto(x,y+fontsize)
+    w:setfont(qt.QFont{serif=true,italic=true,size=fontsize,bold=true})
+
+  end
+
+  w:setcolor("red")
+  w:setlinewidth(2)
+  w:stroke()
+  return w
+end

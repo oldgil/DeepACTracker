@@ -1,0 +1,394 @@
+
+local Trainer = torch.class('rltrack.Trainer')
+
+
+
+-- initial trainer 
+function Trainer:__init(args)
+    -- state contains three parts
+    -- 1, tfeature, is the cnn feature of the target
+    -- 2, single frame raw image
+    -- 3, rois of this frame
+    self.tfeature_dim = args.tfeature_dim
+
+    -- number of actions is defined as the number of rois
+    -- the action is selecting one of the proposels 
+    self.n_actions    = #args.actions
+    
+    self.best         = args.best
+
+    --- epsilon annealing
+    self.ep_start     = args.ep or 1
+    self.ep           = self.ep_start -- Exploration probability.
+    self.ep_end       = args.ep_end or self.e
+    self.ep_endt      = args.ep_endt or 1000000
+
+    --- learing rate annealing
+    self.lr_start       = args.lr or 0.01
+    self.lr             = self.lr_start
+    self.lr_end         = args.lr_end or self.lr
+    self.lr_endt        = args.lr_endt or 1000000
+    self.wc             = args.wc or 0  -- L2 weight cost
+
+    -- in this work, the minibatch size is seted as 1
+    self.minibatch_size = args.minibatch_size  or 1      
+    --self.valid_size     = self.minibatch_size
+
+    --- Reinforcement learning parameters
+    self.discount       = args.discount or 0.99 -- what is this?
+    self.update_freq    = args.update_freq or 1  -- update network
+
+    -- Number of points to replay per learning step
+    self.n_replay       = args.n_replay or 1
+    -- Number of steps after which learning starts
+    self.learn_start    = args.learn_start or 0
+    --Size of the transition table
+    self.replay_memory  = args.replay_memory or 100000
+    -- history length
+    self.hist_len       = args.hist_len or 1
+    
+    self.rescale_r      = args.rescale_r
+    -- reward 
+    self.max_reward     = args.max_reward
+    self.min_reward     = args.min_reward
+    self.clip_delta     = args.clip_delta
+    self.target_q       = args.target_q
+    self.bestq          = 0
+
+    self.gpu            = args.gpu
+
+    
+    self.ncols          = args.ncols or 3  -- number of color channels in input
+    self.input_dims     = args.input_dims or {self.ncols, 600, 600}
+    self.preproc        = args.preproc -- name of preprocessing network
+    self.histType       = args.histType or "linear"  -- history type to use
+    self.histSpacing    = args.histSpacing or 1
+    self.nonTermProb    = args.nonTermProb or 1
+    self.bufferSize     = args.bufferSize or 512
+
+    self.network        = args.network
+    self.rnn_size       = args.rnn_size
+    
+    if not (type(self.network) == 'string') then
+        error("The type of the network provided in Trainer" .. "is not a string!")
+    end
+
+    local msg, err = pcall(require, self.network)
+
+    if not msg then
+        -- try to load saved agent
+        if self.gpu and self.gpu >= 0 then
+            require 'cudnn'
+        end
+        require 'TrackNet'
+        local err_msg, exp = pcall(torch.load,self.network)
+
+        if not err_msg then
+            error("Problem with loading network file"..self.network)
+        end
+
+        if self.best and exp.best_model then
+            self.network = exp.best_model
+        else
+            self.network = exp.model
+        end
+    else
+        print('Creating Agent Network from'..self.network)
+        self.network = err
+        self.network = self.network()
+    end
+
+    -- load preprocessing network
+    if not (type(self.preproc == 'string')) then
+        error('The preprocessing is not a string')
+    end
+    msg, err = pcall(require,self.preproc)
+    if not msg then
+        error("Error loading preprocessing net")
+    end
+    self.preproc = err
+    self.preproc = self:preproc()
+    self.preproc:float()
+    
+    self.numSteps = 0
+    self.lastFrame = nil
+    self.lastAction = nil
+    self.v_avg = 0
+    self.tderr_avg = 0
+
+    self.q_max = 1
+    self.r_max = 1
+
+    self.w, self.dw = self.network:getParameters()
+      self.dw:zero()
+    self.dwt = self.dw:clone():zero()
+    self.deltas = self.dw:clone():fill(0)
+    self.tmp    = self.dw:clone():fill(0)
+    self.g      = self.dw:clone():fill(0)
+    self.g2     = self.dw:clone():fill(0)
+
+    print('Number of all parameters: '..self.w:nElement())
+
+    if self.target_q then
+        self.target_network = self.network:clone()
+        self.tw,self.tdw = self.target_network:getParameters()
+    end
+    
+end
+
+
+function Trainer:reset(state)
+    
+end
+
+
+
+--- calculate the gradOutput based on output Q and target Q
+-- the q dimension is is rois x (rois + 1) this 1 is terminal
+-- the r dimension is rois x 1
+-- the a dimension is rois x 1
+-- the term dimension is rois x 1 (0|1)
+function Trainer:getQUpdate(args)
+    local q2_max, target
+    local q = args.q
+    local a = args.a
+    local r = args.r
+    local q2 = args.q2
+    local term = args.term
+        
+    -- calculate dLoss/dOutput
+    -- Loss = (y - Q(s,a))^2
+    -- y = r + (1-terminal) * gamma*max_aQ(s2,a)
+    -- delta = y - Q(s,a)
+    -- 
+    
+    term = term:clone():mul(-1):add(1)
+        
+    -- q2 is rois x (rois + 1)
+    -- Compute (1-terminal) * gamma * max_a Q(s2, a)
+    q2_max = q2:clone():max(2):mul(self.discount):cmul(term)
+        
+    local delta = r:clone()
+        
+    if self.rescale_r then
+        delta:div(self.r_max)
+    end
+        
+    delta:add(q2_max)
+        
+    -- 和输入输出有关
+    target = torch.repeatTensor(delta,1,self.n_actions) - q
+        
+    local mask = torch.CudaTensor():resizeAs(q):fill(0):scatter(2,a,1)
+    target:cmul(mask)
+    -- target rois x (rois + 1)
+        
+    if self.clip_delta then
+        target[target:ge(self.clip_delta)] = self.clip_delta
+        target[target:le(-self.clip_delta)] = -self.clip_delta
+    end
+
+    return target, q2_max
+    -- target rois x (rois + 1)
+    -- q2_max rois x 1
+end
+
+function Trainer:updateNet()
+    local t = math.max(0,self.numSteps - self.learn_start)
+    self.lr = (self.lr_start - self.lr_end) * (self.lr_endt - t)/self.lr_endt + self.lr_end
+    self.lr = math.max(self.lr,self.lr_end)
+    
+    -- use gradients
+    self.g:mul(0.95):add(0.05, self.dwt)
+    self.tmp:cmul(self.dwt, self.dwt)
+    self.g2:mul(0.95):add(0.05, self.tmp)
+    self.tmp:cmul(self.g, self.g)
+    self.tmp:mul(-1)
+    self.tmp:add(self.g2)
+    self.tmp:add(0.01)
+    self.tmp:sqrt()
+    
+    -- accumulate update
+    -- self.deltas = self.deltas + self.lr*self.dw/self.tmp
+    self.deltas:mul(0):addcdiv(self.lr, self.dwt, self.tmp)
+    self.w:add(self.deltas)
+end
+
+function Trainer:updateTargetNet()
+    self.tw:fill(0):add(self.w)
+end
+
+
+------------------------------------------------------------------
+--boxIoU caculate IoU of two bounding boxes
+-- rois 1 x 4-dimension (x1,y1,x2,y2)
+function Trainer:IoU(box1,box2)
+    local ax1 = box1[1]; local ax2 = box1[3];
+    local ay1 = box1[2]; local ay2 = box1[4];
+
+    local bx1 = box2[1]; local bx2 = box2[3];
+    local by1 = box2[2]; local by2 = box2[4];
+    
+    local hor = math.min(ax2,bx2) - math.max(ax1,bx1)
+
+    local ver = 0
+    if hor > 0 then
+        ver = math.min(ay2,by2) - math.max(ay1,by1)
+    end
+    if ver < 0 then ver = 0 end
+    local isect = hor*ver
+    local union = (ax2-ax1)*(ay2-ay1) + (bx2-bx1)*(by2-by1) - isect
+    if union <= 0 then return 0 end
+
+    return isect / union
+end
+
+-- reword IoU - 0.5
+function Trainer:getReword(a,gt,rois,mode)
+    -- a (t x rois x 1)
+    -- gt (t x rois x 1)
+    -- rois (t x rois x 4)
+    -- return r (t x rois x 1)
+    mode = mode or 1
+    local s = a:size()
+
+    local r = a:clone():fill(0)
+
+    local iterm = rois:size(2) + 1
+    
+    -- Tensor scatter(dim,ind,src|val)
+    -- output rois
+    local orois = rois:clone():fill(0)
+
+    for t = 1:s[1] do
+        for iro = 1:s[2] do
+            -- hard mode
+            if mode == 1 then
+                if a[t][iro][1] == gt[t][iro][1] then
+                    r[t][iro][1] = 1
+                else
+                    r[t][iro][1] = -1
+                end
+            -- soft mode
+            else
+                local box1,box2
+
+                if a[t][iro][1] == iterm then
+                    box1 = torch.Tensor(4):fill(1)
+                    box1[2] = 2
+                    box1[4] = 2
+                else
+                    box1 = rois[t][a[t][iro][1]]:clone()
+                end
+
+                if gt[t][iro][1] == iterm then
+                    box2 = torch.Tensor(4):fill(1)
+                    box2[2] = 2
+                    box2[4] = 2
+                else
+                    box2 = rois[t][gt[t][iro][1]]:clone()
+                end
+                
+                r[t][iro][1] = 2 * self.IoU(box1,box2) - 1
+            end
+        end
+    end
+
+    return r
+
+end
+
+
+function Trainer:oneStep(params)
+    local s = params.s   -- t frames s (framet, roist, featurest-1, gt), concatTable with 3 tensors 
+    --local a = params.a   -- t (n x n)-dimension index the Q-value
+    --local r = params.r   -- t one step reword 0~1 
+    local s2 = params.s2 -- t frames
+    local term = params.term  -- define if is the terminal state, 0 or 1
+
+    self.network:forward(s)   -- exc one step output t x n x n 
+    self.target_network:forward(s2)   -- exc next step
+    
+    local roist = s.roist:clone()
+    local gt    = s.gt:clone()        -- gt rois x 1
+    
+    -- q = self.network.predictions   t x rois x (rois + 1)
+    -- a, (t x rois x 1)
+    -- q_max, (t x rois x 1)
+    local q_max, a = self.network.predictions:max(3)
+    
+    local r = self.getReword(a,gt,roist)   -- r, (t x rois x 1)
+    
+
+    local targets = {}    -- targets are gradOutput -> dLoss/dOutput 
+
+    for t = 1, self.hist_len do
+        targets[t] = self:getQUpdate{
+            q = self.network.predictions[t],
+            a = a[{{t},{},{}}]  
+            r = r[{{t},{},{}}]
+            q2 = self.target_network.predictions[t],
+            term = term[{t},{},{}]
+        }
+    end
+
+    -- get new gradient
+    -- targets  t x n x n
+    self.network:backward(s,targets)
+
+    -- add weight cost to gradient  self.dw = self.dw - self.wc*self.w
+    self.dw:add(-self.wc, self.w)
+    
+    -- update dwt  dwt = dwt + everydw
+    self.dwt:add(self.dw)
+end
+
+function Trainer:qLearnMinibatch()
+    
+
+
+end
+
+function Trainer:eGreedy(frame,testing_ep)
+    self.ep_threshold = testing_ep or (self.ep_end + math.max(0, (self.ep_start - self.ep_end) * (self.ep_endt - math.max(0, self.numSteps - self.learn_start))/self.ep_endt))
+    
+    -- epsilon = ep_end + max(0,(ep_start - ep_end)*(ep_endt - max(0, numsteps - learn_start))/ep_endt))
+
+    local ep = torch.uniform()
+    if ep < self.ep_threshold then
+        return torch.random(1,self.n_actions)
+    else
+        return self:greedy(frame)
+    end
+    
+end
+
+function Trainer:greedy(frame)
+    local q = self.network:predict(frame):float():squeeze()
+    
+    local maxq = q[1]
+    local besta = {1}
+
+    for a = 2,self.n_actions do
+        if q[a] > maxq then
+            besta = {a}
+            maxq = q[a]
+        elseif q[a] = maxq then
+            besta = [#besta + 1] = a
+        end
+    end
+    self.bestq = maxq
+
+    local r = torch.random(1,#besta)
+    return besta[r]
+end
+
+function Trainer:report()
+    local cnn = self.network.protos.cnn
+    print('CNN')
+    print(get_weight_norms(cnn))
+    print(get_grad_norms(cnn))
+    print('DQN')
+    print(get_weight_norms(self.network.protos.dqn))
+    print(get_grad_norms(self.network.protos.dqn))
+end
